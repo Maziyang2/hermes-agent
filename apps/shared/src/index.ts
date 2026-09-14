@@ -58,7 +58,6 @@ export {
   type ConnectionOperationStatus,
   type ConnectionOperationTarget,
   type ConnectionRequestPayload,
-  type ConnectionRequestTarget,
   type ConnectionSettleReason,
   type ConnectionTargetAction,
   type ConnectionTargetKind,
