@@ -83,6 +83,12 @@ class StreamConsumerConfig:
     # real text replaces and the final edit never carries. See #110564.
     single_message_activity: bool = False
     single_message_thinking: bool = False
+    # Single-message overflow policy: false (default) = deferred pagination — the preview
+    # is NOT cut while the turn runs; an over-limit turn-final is paged by the adapter's
+    # overflow split instead, so the live phase stays one message and pages only appear
+    # when the text genuinely overflows. true = eager ≤limit seals mid-stream (the reply
+    # arrives as several long messages). See #110564.
+    single_message_4096_split: bool = False
 
 
 @dataclass
@@ -251,6 +257,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def single_message_mode(self) -> bool:
         """One evolving preview for the whole turn (opt-in; see #110564)."""
         return bool(self.cfg.single_message_per_turn)
+
+    def _eager_overflow_split(self) -> bool:
+        """Whether over-limit content is sealed into separate messages mid-stream.
+
+        True for classic streaming. In single-message mode the default (``false``) defers
+        pagination to the turn-final adapter overflow split, so the live phase keeps one
+        message; opt back in with ``streaming_single_message_4096_split: true``."""
+        if not self.single_message_mode:
+            return True
+        return bool(self.cfg.single_message_4096_split)
 
     @property
     def accepts_tool_progress(self) -> bool:
@@ -604,10 +620,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     # is split again below. A plain first send would let the adapter split it and
                     # adopt only the LAST chunk as the preview; the next seal then overwrites that
                     # chunk with the head of the whole remainder (duplicated + lost text, #25349).
-                    await self._seal_overflow_heads()
+                    if self._eager_overflow_split():
+                        await self._seal_overflow_heads()
                     # Overflow split.  Native streaming bypasses this: the adapter
                     # truncates against the stream protocol's own limit.
-                    if not self._use_native_streaming and self._first_send_overflows():
+                    if (self._eager_overflow_split()
+                            and not self._use_native_streaming and self._first_send_overflows()):
                         if await self._split_first_send(tick):
                             return
                         if self._first_send_overflows():
