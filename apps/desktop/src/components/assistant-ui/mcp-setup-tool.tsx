@@ -191,7 +191,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
   const cancelRef = useRef(false)
 
   // `tool.start` arrives before `connection.request`.
-  const ready = Boolean(request?.requestId)
+  const ready = Boolean(request)
 
   const respond = useCallback(
     async (outcome: ConnectionTargetOutcome) => {
@@ -205,14 +205,14 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
         return
       }
 
-      const success = outcome.status === 'installed' || outcome.status === 'enabled' || outcome.status === 'authorized'
+      const success = outcome.status === 'connected'
 
       if (success) {
         invalidateMcpSuggestionIndex()
       }
 
       try {
-        await respondToConnectionRequest(request, { settled_by: 'all_resolved', targets: [outcome] })
+        await respondToConnectionRequest(request, { targets: [outcome] })
       } catch (error) {
         notifyError(error, copy.sendFailed)
       }
@@ -224,7 +224,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
     // Respond first; cancelRef stops abandoned work at its next poll.
     cancelRef.current = true
     triggerHaptic('cancel')
-    void respond({ name: server, status: 'declined' })
+    void respond({ name: server, status: 'skipped' })
   }, [respond, server])
 
   const approve = useCallback(async () => {
@@ -245,7 +245,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       if (action === 'enable') {
         await setMcpServerEnabled(server, true)
         triggerHaptic('submit')
-        await respond({ name: server, status: 'enabled' })
+        await respond({ name: server, status: 'connected' })
 
         return
       }
@@ -258,7 +258,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
         })
 
         triggerHaptic('submit')
-        await respond({ name: server, status: 'authorized', tools: (flow.tools ?? []).map(tool => tool.name) })
+        await respond({ name: server, status: 'connected', tools: (flow.tools ?? []).map(tool => tool.name) })
 
         return
       }
@@ -272,7 +272,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       }
 
       if (!resolved) {
-        await respond({ detail: copy.notInCatalog(server), name: server, status: 'error' })
+        await respond({ detail: copy.notInCatalog(server), name: server, status: 'failed' })
 
         return
       }
@@ -305,7 +305,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       }
 
       triggerHaptic('submit')
-      await respond({ name: server, status: 'installed' })
+      await respond({ name: server, status: 'connected' })
     } catch (error) {
       // The declined response is already sent; do not report cancellation as failure.
       if (error === CANCELLED || error instanceof McpOAuthCancelled) {
@@ -316,7 +316,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       await respond({
         detail: error instanceof Error ? error.message : String(error),
         name: server,
-        status: 'error'
+        status: 'failed'
       })
     } finally {
       setWorking(false)
