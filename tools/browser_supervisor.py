@@ -353,9 +353,18 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         A failure before the first successful attach is fatal for ``start()``."""
         attempt, last_success_at, backoff = 0, 0.0, 0.5
         import websockets  # deferred: only supervisors that connect pay the import
+        from urllib.parse import urlsplit
+
+        from tools.environments.local import is_loopback_host
+        # A loopback CDP endpoint must never be dialed through a proxy: websockets>=14
+        # auto-detects the system proxy (macOS ``_scproxy``) unless disabled (#110565).
+        connect_kwargs: Dict[str, Any] = (
+            {"proxy": None} if is_loopback_host(urlsplit(self.cdp_url).hostname) else {}
+        )
         while not self._stop_requested:
             try:
-                self._ws = await asyncio.wait_for(websockets.connect(self.cdp_url, max_size=50 * 1024 * 1024), timeout=10.0)
+                self._ws = await asyncio.wait_for(websockets.connect(
+                    self.cdp_url, max_size=50 * 1024 * 1024, **connect_kwargs), timeout=10.0)
             except Exception as e:
                 attempt += 1
                 if self._fail_start(e):

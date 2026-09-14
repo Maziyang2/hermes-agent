@@ -264,16 +264,44 @@ def _filter_secret_env(
             out[key] = value
 
 
+# Loopback must never be dialed through a proxy: websockets>=14 auto-detects the macOS
+# system proxy (``_scproxy``) and would route local CDP/websocket dials through it unless
+# NO_PROXY excludes loopback. Guaranteed for every child env that funnels through
+# ``_finalize_child_env`` (#110565).
+_LOOPBACK_NO_PROXY_ENTRIES = ("127.0.0.1", "localhost", "::1")
+
+
+def is_loopback_host(host: str | None) -> bool:
+    """True for hosts that must always bypass a proxy (loopback)."""
+    return (host or "").strip().lower() in _LOOPBACK_NO_PROXY_ENTRIES
+
+
+def add_loopback_no_proxy(env: dict) -> dict:
+    """Append loopback entries to ``NO_PROXY``/``no_proxy`` (both casings) in *env*.
+
+    Existing entries are preserved; only missing loopback entries are appended. Local
+    CDP/service dials from Hermes children must never be captured by an inherited or
+    auto-detected proxy (#110565).
+    """
+    for key in ("NO_PROXY", "no_proxy"):
+        entries = [part for part in (env.get(key) or "").replace(",", " ").split() if part]
+        for entry in _LOOPBACK_NO_PROXY_ENTRIES:
+            if entry not in entries:
+                entries.append(entry)
+        env[key] = ",".join(entries)
+    return env
+
+
 def _finalize_child_env(env: dict) -> dict:
     """Guards shared by every spawn surface: profile-home propagation, session-context
     bridging, Hermes-owned PYTHONPATH + venv-marker strip, MSYS defaults, delegate_task
-    Kanban scrub. Returns the (possibly new) dict."""
+    Kanban scrub, loopback NO_PROXY guarantee. Returns the (possibly new) dict."""
     _apply_profile_home(env)
     _inject_session_context_env(env)
     _strip_hermes_owned_pythonpath_and_runtime_markers(env)
     _apply_windows_msys_bash_env_defaults(env)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    return add_loopback_no_proxy(delegated_child_subprocess_env(env))
 
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:

@@ -14,7 +14,7 @@ full credential environment. Two tiers:
 import os
 from unittest.mock import patch
 
-from tools.environments.local import hermes_subprocess_env
+from tools.environments.local import _sanitize_subprocess_env, hermes_subprocess_env
 from tools.environments.local_env_policy import _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_FORCE_PREFIX
 
 
@@ -224,3 +224,45 @@ class TestInternalDynamicSecrets:
         assert {
             "GATEWAY_RELAY_ID", "GATEWAY_RELAY_SECRET", "GATEWAY_RELAY_DELIVERY_KEY",
         } <= _ALWAYS_STRIP_KEYS
+
+
+def _entries(value: str | None) -> set:
+    """NO_PROXY entries from either casing, comma- or space-separated."""
+    return {part for part in (value or "").replace(",", " ").split() if part}
+
+
+class TestLoopbackNoProxy:
+    """Loopback must never be dialed through a proxy. On macOS, ``websockets>=14``
+    auto-detects the system proxy (``_scproxy``) unless ``NO_PROXY`` excludes loopback,
+    which broke the browser harness's local CDP connect (issue #110565). Every child
+    env builder must guarantee loopback entries, additively."""
+
+    def test_builders_add_loopback_entries(self):
+        with patch.dict(os.environ, _SAFE_SAMPLE, clear=True):
+            built = {
+                "hermes_subprocess_env": hermes_subprocess_env(),
+                "_sanitize_subprocess_env": _sanitize_subprocess_env({"PATH": "/usr/bin:/bin"}),
+            }
+        for builder, env in built.items():
+            for key in ("NO_PROXY", "no_proxy"):
+                entries = _entries(env.get(key))
+                assert {"127.0.0.1", "localhost", "::1"} <= entries, (
+                    f"{builder}() must add loopback entries for {key}; got {env.get(key)!r}"
+                )
+
+    def test_builders_preserve_existing_entries(self):
+        seed = {**_SAFE_SAMPLE, "NO_PROXY": "example.com", "no_proxy": "corp.internal"}
+        with patch.dict(os.environ, seed, clear=True):
+            env = hermes_subprocess_env()
+        for key, kept in (("NO_PROXY", "example.com"), ("no_proxy", "corp.internal")):
+            entries = _entries(env.get(key))
+            assert kept in entries, f"pre-existing {key} entry {kept!r} was dropped"
+            assert {"127.0.0.1", "localhost", "::1"} <= entries
+
+    def test_is_loopback_host(self):
+        from tools.environments.local import is_loopback_host
+
+        for host in ("127.0.0.1", "localhost", "::1", "LOCALHOST"):
+            assert is_loopback_host(host)
+        for host in ("example.com", "198.18.0.29", "10.0.0.5", ""):
+            assert not is_loopback_host(host)
