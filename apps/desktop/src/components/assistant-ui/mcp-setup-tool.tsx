@@ -39,11 +39,9 @@ interface SetupArgs {
 
 const CATALOG_INSTALL_POLL_MS = 1500
 
-// Thrown by the in-flight flow when the user cancels — the declined respond
-// has already been sent, so the catch path must swallow this, not report it.
+// The declined response is already sent before this sentinel reaches the catch path.
 const CANCELLED = Symbol('mcp-setup-cancelled')
 
-/** First MCP target of a `manage_connections` call; the card renders one server. */
 function readSetupArgs(args: unknown): SetupArgs {
   const row = parseMaybeObject(args)
   const [target] = mcpTargets('manage_connections', row)
@@ -55,7 +53,6 @@ function readSetupArgs(args: unknown): SetupArgs {
   }
 }
 
-/** The first target's state from the settled operation. */
 interface SettledResult {
   status?: 'connected' | 'not_connected' | 'skipped' | 'unavailable'
   detail?: string
@@ -83,9 +80,6 @@ function readSetupResult(result: unknown): SettledResult {
 
 const SHELL_CLASS = `${WIDGET_SHELL_CLASS} text-[length:var(--conversation-text-font-size)] text-(--ui-text-primary)`
 
-/** The card's strings, from this tool's own copy. The verb changes with the
- *  action (Install / Enable / Authorize); the rest is the shared consent
- *  vocabulary every connector card speaks. */
 function cardCopy(
   copy: ReturnType<typeof useI18n>['t']['assistant']['mcpSetup'],
   action: SetupAction
@@ -113,7 +107,6 @@ function cardCopy(
 }
 
 export const McpSetupTool = (props: ToolCallMessagePartProps) => {
-  // Settled → static outcome line (the flow already ran or was declined).
   if (props.result !== undefined) {
     return <McpSetupSettled {...props} />
   }
@@ -124,7 +117,6 @@ export const McpSetupTool = (props: ToolCallMessagePartProps) => {
 const McpSetupLive = (props: ToolCallMessagePartProps) => {
   const messageRunning = useAuiState(selectMessageRunning)
 
-  // Stopped mid-prompt with no result — don't leave a dead interactive panel.
   if (!messageRunning) {
     return <ToolFallback {...props} />
   }
@@ -162,8 +154,6 @@ function McpSetupSettled({ args, result }: ToolCallMessagePartProps) {
   const neutral = status === 'skipped' || (status === 'not_connected' && fromResult.detail === 'deadline')
   const toolCount = Array.isArray(fromResult.tools) ? fromResult.tools.length : 0
 
-  // Settled is scaffolding, the same line a spent connector offer collapses
-  // to: the name, then the verdict as meta. A failure keeps its reason.
   return (
     <ConnectorSummary
       connector={{ name: server, title: displayName }}
@@ -182,8 +172,7 @@ function McpSetupSettled({ args, result }: ToolCallMessagePartProps) {
 function McpSetupPending({ args }: ToolCallMessagePartProps) {
   const { t } = useI18n()
   const copy = t.assistant.mcpSetup
-  // The tool row is in whichever session's transcript rendered it — read THAT
-  // session's request (primary or tile), not the globally-active one.
+  // Use the rendering transcript's session, not the globally active one.
   const sessionId = useStore(useSessionView().$runtimeId)
   const $request = useMemo(() => sessionConnectionRequest(sessionId), [sessionId])
   const request = useStore($request)
@@ -199,12 +188,9 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
   const [envDraft, setEnvDraft] = useState<Record<string, string>>({})
   const [entry, setEntry] = useState<McpCatalogEntry | null | undefined>(undefined)
   const [envOpen, setEnvOpen] = useState(false)
-  // Set when the user cancels mid-flight (a stuck OAuth tab, a hung install).
-  // The in-flight flow checks it at every poll boundary and aborts via the
-  // CANCELLED sentinel; the declined respond has already been sent by then.
   const cancelRef = useRef(false)
 
-  // tool.start arrives before connection.request; disable the buttons until the request exists.
+  // `tool.start` arrives before `connection.request`.
   const ready = Boolean(request?.requestId)
 
   const respond = useCallback(
@@ -222,12 +208,10 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       const success = outcome.status === 'installed' || outcome.status === 'enabled' || outcome.status === 'authorized'
 
       if (success) {
-        // No reload.mcp: the between-turns refresh registers the new server's tools.
         invalidateMcpSuggestionIndex()
       }
 
       try {
-        // One target: this answer settles the operation.
         await respondToConnectionRequest(request, { settled_by: 'all_resolved', targets: [outcome] })
       } catch (error) {
         notifyError(error, copy.sendFailed)
@@ -237,8 +221,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
   )
 
   const decline = useCallback(() => {
-    // While a flow is in flight this is a CANCEL: answer declined right away
-    // and let the abandoned work notice via cancelRef at its next poll.
+    // Respond first; cancelRef stops abandoned work at its next poll.
     cancelRef.current = true
     triggerHaptic('cancel')
     void respond({ name: server, status: 'declined' })
@@ -249,8 +232,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
     const oauthScope = capabilityScoped()
     setWorking(true)
 
-    // Poll-boundary abort for the background-install loop; the OAuth flows
-    // carry their own cancel via completeMcpDesktopOAuth's `cancelled`.
+    // OAuth owns its cancellation; polling needs an explicit boundary check.
     const throwIfCancelled = <T,>(value: T): T => {
       if (cancelRef.current) {
         throw CANCELLED
@@ -281,7 +263,6 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
         return
       }
 
-      // Install from the catalog only. Required credentials are prompted inline first.
       let resolved = entry
 
       if (resolved === undefined) {
@@ -299,7 +280,6 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       const required = resolved.required_env.filter(env => env.required)
 
       if (required.some(env => !envDraft[env.name]?.trim())) {
-        // Reveal the credential fields; the user approves again once filled.
         setEnvOpen(true)
 
         return
@@ -307,8 +287,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
 
       const res = await installMcpCatalogEntry(server, envDraft)
 
-      // Git-backed entries clone in the background — poll to completion so a
-      // non-zero exit surfaces as a real failure instead of a false success.
+      // Poll background installs so non-zero exits cannot report false success.
       if (res.background && res.action) {
         for (;;) {
           const status = throwIfCancelled(await getActionStatus(res.action, 1))
@@ -328,8 +307,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
       triggerHaptic('submit')
       await respond({ name: server, status: 'installed' })
     } catch (error) {
-      // User cancel: the declined respond is already on the wire — the
-      // abandoned flow just stops, nothing to report.
+      // The declined response is already sent; do not report cancellation as failure.
       if (error === CANCELLED || error instanceof McpOAuthCancelled) {
         return
       }
@@ -350,12 +328,7 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
 
   const sourceLine = action === 'install' ? (entry?.url ?? copy.catalogSource) : null
 
-  // ⌘/Ctrl+Enter → approve, Esc → decline/cancel. Same accelerators, same
-  // guard shape as the approval bar (tool/approval.tsx). Unlike approve, Esc
-  // stays live while a flow is in flight — that's the cancel path. Stands
-  // down whenever a focusable control has focus (clarify's rule): a keystroke
-  // meant for the composer, a popover, or the card's own credential fields
-  // must never silently approve an install or throw away typed input.
+  // Do not capture shortcuts while a focusable control owns typed input.
   useEffect(() => {
     if (!ready) {
       return
@@ -400,9 +373,6 @@ function McpSetupPending({ args }: ToolCallMessagePartProps) {
     )
   }
 
-  // The same consent card the connector offer renders: one shape for every
-  // "connect this?" in the transcript. `phase` is what flips the card into
-  // its working state (spinner on the action, decline becomes cancel).
   return (
     <ConnectorCard
       accelerators
