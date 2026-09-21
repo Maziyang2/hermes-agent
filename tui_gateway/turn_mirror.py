@@ -17,9 +17,11 @@ cron-delivery helper chain, so no live gateway connection is required:
     the assistant's reply
 
 Only complete exchanges are mirrored; nothing is sent for synthetic turns (compaction markers,
-auto-continue, background notices), silent responses, or empty replies.  Delivery happens on a
-detached daemon thread and every failure is contained to a log line — a mirror must never delay,
-break, or alter the turn it mirrors.
+auto-continue, background notices), silent responses, or empty replies.  A completed turn with a
+request id first becomes a durable delivery obligation in the transport profile's state store;
+the existing bounded retry/recovery sweep can then resume it after a crash without duplicating a
+recorded turn.  The actual send still happens on a detached daemon thread and every failure is
+contained to a log line — a mirror must never delay, break, or alter the turn it mirrors.
 
 Config (resolved like every display setting: ``display.platforms.<platform>.<key>`` wins, the
 top-level ``display.<key>`` is the fallback; defaults in parentheses):
@@ -36,10 +38,12 @@ top-level ``display.<key>`` is the fallback; defaults in parentheses):
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import dataclasses
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,9 @@ class MirrorPlan:
     thread_id: Optional[str] = None
     silent: bool = True
     chunk_indicators: bool = True  # False in the "split into standalone messages" mode
+    session_key: str = ""
+    adapter_profile: Optional[str] = None
+    obligation_id: Optional[str] = None
 
 
 def quote_block(text: str) -> str:
@@ -91,7 +98,8 @@ def mirror_settings(cfg: dict, platform: str) -> Optional[dict]:
 
 def build_mirror_plan(*, platform: str, chat_id: str, thread_id: Optional[str],
                       user_text: Any, reply_text: Any, display_kind: Optional[str],
-                      rid: str, cfg: dict) -> Optional[MirrorPlan]:
+                      rid: str, cfg: dict, session_key: str = "",
+                      adapter_profile: Optional[str] = None) -> Optional[MirrorPlan]:
     """The one decision point; returns what to send, or None. No I/O — pure and testable."""
     if display_kind or str(rid).startswith("__"):
         return None  # synthetic turn: compaction marker, auto-continue, relay, ...
@@ -112,11 +120,17 @@ def build_mirror_plan(*, platform: str, chat_id: str, thread_id: Optional[str],
         message=compose_mirror_message(user_text, reply, settings["label"]),
         silent=settings["silent"],
         chunk_indicators=settings["chunk_indicators"],
+        session_key=str(session_key or ""),
+        adapter_profile=str(adapter_profile).strip() if adapter_profile else None,
     )
 
 
-def resolve_mirror_target(session: dict, agent: Any) -> tuple[str, str, Optional[str]]:
-    """``(platform, chat_id, thread_id)`` for the session's own chat, or ``("", "", None)``.
+def resolve_mirror_target(session: dict, agent: Any) -> tuple[str, str, Optional[str], Optional[str]]:
+    """``(platform, chat_id, thread_id, adapter_profile)`` for the session's own chat.
+
+    ``adapter_profile`` is the persisted transport owner, not merely the
+    runtime profile. Shared-bot multiplexing can run a session in one profile
+    while the receiving bot belongs to another.
 
     Reads the gateway-stored ``source``/``chat_id``/``thread_id`` off the session row — the same
     facts the gateway itself would deliver to.  Fail-closed: any missing piece skips the mirror
@@ -124,7 +138,7 @@ def resolve_mirror_target(session: dict, agent: Any) -> tuple[str, str, Optional
     """
     session_id = str(getattr(agent, "session_id", "") or "").strip() or str(session.get("session_key") or "").strip()
     if not session_id:
-        return "", "", None
+        return "", "", None, None
     row: dict = {}
     try:
         from tui_gateway.session_workdir import _session_db
@@ -135,11 +149,75 @@ def resolve_mirror_target(session: dict, agent: Any) -> tuple[str, str, Optional
             row = fetched if isinstance(fetched, dict) else {}
     except Exception:
         logger.debug("mirror target lookup failed", exc_info=True)
-        return "", "", None
+        return "", "", None, None
     platform = str(row.get("source") or "").strip().lower()
     chat_id = str(row.get("chat_id") or "").strip()
     thread_id = str(row.get("thread_id") or "").strip() or None
-    return platform, chat_id, thread_id
+    adapter_profile = str(row.get("transport_profile") or row.get("profile_name") or "").strip() or None
+    return platform, chat_id, thread_id, adapter_profile
+
+
+def _mirror_obligation_id(plan: MirrorPlan, rid: str) -> Optional[str]:
+    """Stable delivery id for one local turn; no id means no durable dedupe."""
+    if not plan.session_key or not str(rid or "").strip():
+        return None
+    try:
+        from gateway.delivery_ledger import compute_obligation_id
+        return compute_obligation_id(plan.session_key, str(rid).strip(), plan.message)
+    except Exception:
+        logger.debug("mirror obligation id calculation failed", exc_info=True)
+        return None
+
+
+def _record_mirror_obligation(plan: MirrorPlan, obligation_id: Optional[str]) -> Optional[bool]:
+    """Persist a mirror before spawning its network send.
+
+    Returns ``True`` when this call owns a new row, ``False`` when the same
+    local turn was already recorded, and ``None`` when the best-effort ledger
+    is unavailable. A ledger failure must not break the local turn.
+    """
+    if not obligation_id:
+        return None
+    try:
+        from gateway.delivery_ledger import ledger_enabled, record_obligation
+        with _mirror_delivery_scope(plan.adapter_profile):
+            if not ledger_enabled():
+                return None
+            return bool(record_obligation(
+                obligation_id=obligation_id,
+                session_key=plan.session_key,
+                platform=plan.platform,
+                chat_id=plan.chat_id,
+                thread_id=plan.thread_id,
+                content=plan.message,
+                adapter_profile=plan.adapter_profile,
+                metadata={"notify": not plan.silent},
+                preserve_existing=True,
+            ))
+    except Exception:
+        logger.debug("mirror delivery obligation record failed", exc_info=True)
+        return None
+
+
+@contextlib.contextmanager
+def _mirror_delivery_scope(adapter_profile: Optional[str]):
+    """Bind standalone credentials to the persisted transport-owning profile."""
+    if not adapter_profile:
+        yield
+        return
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        from tui_gateway import server
+        raw_profile_scope = getattr(server, "_session_profile_runtime_scope", None)
+        if not callable(raw_profile_scope):
+            raise RuntimeError("TUI profile runtime scope is not installed")
+        profile_scope = cast(Callable[[dict], contextlib.AbstractContextManager], raw_profile_scope)
+        home = None if adapter_profile == "default" else str(get_profile_dir(adapter_profile))
+        with profile_scope({"profile_home": home}):
+            yield
+    except Exception:
+        logger.warning("mirror delivery profile scope unavailable for %s", adapter_profile, exc_info=True)
+        raise
 
 
 def mirror_turn(session: dict, agent: Any, user_text: Any, reply_text: Any, *,
@@ -149,7 +227,7 @@ def mirror_turn(session: dict, agent: Any, user_text: Any, reply_text: Any, *,
     Never raises and never blocks the caller (the turn's own worker thread).
     """
     try:
-        platform, chat_id, thread_id = resolve_mirror_target(session, agent)
+        platform, chat_id, thread_id, adapter_profile = resolve_mirror_target(session, agent)
         if not platform:
             return
         from tui_gateway.session_lifecycle import _is_gateway_owned_source
@@ -162,13 +240,26 @@ def mirror_turn(session: dict, agent: Any, user_text: Any, reply_text: Any, *,
             platform=platform, chat_id=chat_id, thread_id=thread_id,
             user_text=user_text, reply_text=reply_text,
             display_kind=display_kind, rid=rid, cfg=_load_cfg(),
+            session_key=str(session.get("session_key") or getattr(agent, "session_id", "") or "").strip(),
+            adapter_profile=adapter_profile,
         )
         if plan is None:
             return
     except Exception:
         logger.debug("mirror decision failed", exc_info=True)
         return
-    _start_delivery(plan)
+    obligation_id = _mirror_obligation_id(plan, rid)
+    recorded = _record_mirror_obligation(plan, obligation_id)
+    if recorded is False:
+        logger.debug("turn mirror already recorded for %s", obligation_id)
+        return
+    if recorded is True and obligation_id:
+        plan = dataclasses.replace(plan, obligation_id=obligation_id)
+    try:
+        _start_delivery(plan)
+    except Exception:
+        # The pending row remains recoverable if thread creation itself fails.
+        logger.warning("turn mirror delivery thread could not start", exc_info=True)
 
 
 def _start_delivery(plan: MirrorPlan) -> None:
@@ -178,18 +269,38 @@ def _start_delivery(plan: MirrorPlan) -> None:
 
 def _deliver(plan: MirrorPlan) -> None:
     """Send the mirror through the platform plugin's standalone sender; contain all failures."""
+    obligation_id = plan.obligation_id
     try:
         from gateway.config import PlatformConfig
         from tools.send_message_senders import _registry_standalone_send
 
-        result = asyncio.run(_registry_standalone_send(
-            plan.platform, PlatformConfig(enabled=True), plan.chat_id, plan.message,
-            thread_id=plan.thread_id, silent=plan.silent, chunk_indicators=plan.chunk_indicators,
-        ))
-        if isinstance(result, dict) and result.get("error"):
+        if obligation_id:
+            with contextlib.suppress(Exception):
+                from gateway.delivery_ledger import mark_attempting
+                mark_attempting(obligation_id)
+        with _mirror_delivery_scope(plan.adapter_profile):
+            result = asyncio.run(_registry_standalone_send(
+                plan.platform, PlatformConfig(enabled=True), plan.chat_id, plan.message,
+                thread_id=plan.thread_id, silent=plan.silent, chunk_indicators=plan.chunk_indicators,
+            ))
+        if not isinstance(result, dict) or not result.get("success"):
+            error = str(result.get("error") or "standalone sender returned no success") \
+                if isinstance(result, dict) else "standalone sender returned an invalid result"
+            if obligation_id:
+                with contextlib.suppress(Exception):
+                    from gateway.delivery_ledger import mark_failed
+                    mark_failed(obligation_id, error)
             logger.warning("turn mirror send failed (%s:%s): %s",
-                           plan.platform, plan.chat_id, result.get("error"))
+                           plan.platform, plan.chat_id, error)
         else:
+            if obligation_id:
+                with contextlib.suppress(Exception):
+                    from gateway.delivery_ledger import mark_delivered
+                    mark_delivered(obligation_id, str(result.get("message_id") or "") or None)
             logger.debug("turn mirror sent to %s:%s", plan.platform, plan.chat_id)
-    except Exception:
+    except Exception as exc:
+        if obligation_id:
+            with contextlib.suppress(Exception):
+                from gateway.delivery_ledger import mark_failed
+                mark_failed(obligation_id, str(exc))
         logger.warning("turn mirror send failed (%s:%s)", plan.platform, plan.chat_id, exc_info=True)
