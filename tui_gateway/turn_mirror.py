@@ -17,11 +17,12 @@ cron-delivery helper chain, so no live gateway connection is required:
     the assistant's reply
 
 Only complete exchanges are mirrored; nothing is sent for synthetic turns (compaction markers,
-auto-continue, background notices), silent responses, or empty replies.  A completed turn with a
-request id first becomes a durable delivery obligation in the transport profile's state store;
-the existing bounded retry/recovery sweep can then resume it after a crash without duplicating a
-recorded turn.  The actual send still happens on a detached daemon thread and every failure is
-contained to a log line — a mirror must never delay, break, or alter the turn it mirrors.
+auto-continue, background notices), silent responses, or empty replies. A completed turn with a
+request id first becomes a durable delivery obligation in the gateway's launch-context state store,
+tagged with its transport profile; the existing bounded retry/recovery sweep can then resume it
+after a crash without duplicating a recorded turn. The actual send still happens on a detached
+daemon thread and every failure is contained to a log line — a mirror must never delay, break, or
+alter the turn it mirrors.
 
 Config (resolved like every display setting: ``display.platforms.<platform>.<key>`` wins, the
 top-level ``display.<key>`` is the fallback; defaults in parentheses):
