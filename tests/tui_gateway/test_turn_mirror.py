@@ -218,7 +218,7 @@ class TestMirrorTurn:
             SimpleNamespace(session_id="sid1"), "hello", "world", rid="rid-1")
         assert delivered == []
 
-    def test_records_in_transport_profile_store_and_restores_launch_scope(self, monkeypatch, tmp_path):
+    def test_records_in_shared_ledger_and_restores_launch_scope(self, monkeypatch, tmp_path):
         launch_home = tmp_path / "launch"
         transport_home = launch_home / "profiles" / "ops"
         transport_home.mkdir(parents=True)
@@ -232,12 +232,13 @@ class TestMirrorTurn:
             adapter_profile="ops", silent=True)
         assert turn_mirror._record_mirror_obligation(plan, "ob-1") is True
 
-        with sqlite3.connect(transport_home / "state.db") as conn:
+        with sqlite3.connect(launch_home / "state.db") as conn:
             row = conn.execute(
-                "SELECT state, metadata_json FROM delivery_obligations WHERE obligation_id='ob-1'"
+                "SELECT state, metadata_json, adapter_profile FROM delivery_obligations "
+                "WHERE obligation_id='ob-1'"
             ).fetchone()
-        assert row == ("pending", '{"notify":false}')
-        assert not (launch_home / "state.db").exists()
+        assert row == ("pending", '{"notify":false}', "ops")
+        assert not (transport_home / "state.db").exists()
         assert os.environ["HERMES_HOME"] == str(launch_home)
 
     def test_skips_non_gateway_sources(self, monkeypatch, delivered):
