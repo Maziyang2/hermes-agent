@@ -750,7 +750,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                             if not existing.startswith("💭")
                         ]
                     self._tool_progress_lines.append(line)
-                    if len(self._tool_progress_lines) > 6:
+                    if self.single_message_mode and len(self._tool_progress_lines) > 6:
                         del self._tool_progress_lines[:-6]  # defensive cap
                     self._tool_progress_active = True
             elif kind is _APPROVAL_BOUNDARY:
@@ -917,6 +917,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     display_text += self.cfg.cursor
             else:
                 display_text += self.cfg.cursor
+        if not tick.got_done and self.single_message_mode and not self._eager_overflow_split():
+            # Keep the full answer buffered; an oversized preview would make the adapter
+            # create continuation messages before the deferred final pagination.
+            limit = _custom_unit_to_cp(display_text, self._safe_limit, self._len_fn)
+            display_text = display_text[:limit]
 
         # A got_done FRESH send via the draft transport already carries finalize=True,
         # unlike an EDIT, which REQUIRES_EDIT_FINALIZE adapters still need a pass for.

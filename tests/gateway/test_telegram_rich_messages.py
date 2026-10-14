@@ -19,7 +19,8 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-from plugins.platforms.telegram.adapter import TelegramAdapter, _MESSAGE_EFFECT_IDS
+from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.telegram_stream_extras import _MESSAGE_EFFECT_IDS
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 

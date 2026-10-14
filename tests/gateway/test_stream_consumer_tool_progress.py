@@ -7,6 +7,7 @@ bubble and properly overwritten by text deltas (Strategy B).
 from __future__ import annotations
 
 import asyncio
+from tests.waiting import async_wait_until
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -264,11 +265,10 @@ class TestSingleMessageOverlayDrain:
         consumer.on_tool_progress("🔧 terminal: ls")
 
         task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.25)
+        await async_wait_until(lambda: any("🔧" in c for c in adapter.sends))
         consumer.on_delta("Final answer")
         consumer.finish("Final answer")
-        await asyncio.sleep(0.25)
-        await task
+        await asyncio.wait_for(task, timeout=10)
 
         # The overlay alone opened the preview message.
         assert any("🔧" in (s or "") for s in adapter.sends), adapter.sends
@@ -281,15 +281,13 @@ class TestSingleMessageOverlayDrain:
     async def test_text_overlay_strategy_b_then_text_clears_it(self):
         consumer, adapter = _make_single_consumer()
         task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.05)
         consumer.on_delta("Part one. ")
-        await asyncio.sleep(0.25)
+        await async_wait_until(lambda: adapter.sends)
         consumer.on_tool_progress("🔧 web_search: query")
-        await asyncio.sleep(0.25)
+        await async_wait_until(lambda: any("🔧" in c for c in adapter.edits))
         consumer.on_delta("Part two.")
         consumer.finish("Part one. Part two.")
-        await asyncio.sleep(0.25)
-        await task
+        await asyncio.wait_for(task, timeout=10)
 
         # Strategy B frame: text + rule + tool line while the tool runs.
         assert any(
@@ -305,13 +303,12 @@ class TestSingleMessageOverlayDrain:
         consumer.on_tool_progress("💭 first thought")
 
         task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.25)
+        await async_wait_until(lambda: adapter.sends)
         consumer.on_tool_progress("💭 second thought")
-        await asyncio.sleep(0.25)
+        await async_wait_until(lambda: any("second thought" in c for c in adapter.edits))
         consumer.on_delta("Answer")
         consumer.finish("Answer")
-        await asyncio.sleep(0.25)
-        await task
+        await asyncio.wait_for(task, timeout=10)
 
         history = [c for c in adapter.sends + adapter.edits if c]
         assert any("💭 second thought" in c for c in history), history
@@ -327,11 +324,9 @@ class TestSingleMessageOverlayDrain:
         consumer.on_tool_progress("🔧 nope")
 
         task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.2)
         consumer.on_delta("x")
         consumer.finish("x")
-        await asyncio.sleep(0.2)
-        await task
+        await asyncio.wait_for(task, timeout=10)
 
         history = [c for c in adapter.sends + adapter.edits if c]
         assert not any("🔧" in c for c in history), history
@@ -386,13 +381,11 @@ class TestSingleMessageDraftLane:
         )
         consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
         task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.05)
         consumer.on_tool_progress("🔧 terminal: ls")
-        await asyncio.sleep(0.25)
+        await async_wait_until(lambda: any("🔧" in c for c in adapter.drafts))
         consumer.on_delta("Full answer")
         consumer.finish("Full answer")
-        await asyncio.sleep(0.25)
-        await task
+        await asyncio.wait_for(task, timeout=10)
 
         # Overlay rode the ephemeral draft preview…
         assert any("🔧" in (d or "") for d in adapter.drafts), adapter.drafts
@@ -420,20 +413,21 @@ class TestSingleMessageOverflowPolicy:
 
     async def _run_big(self, consumer):
         task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.05)
         consumer.on_delta("A" * 2500)
-        await asyncio.sleep(0.25)
+        await async_wait_until(lambda: consumer.adapter.sends)
         consumer.on_delta("\n" + "B" * 2500)
-        await asyncio.sleep(0.25)
+        await async_wait_until(lambda: any("B" in c for c in consumer.adapter.edits + consumer.adapter.sends))
+        interim = list(consumer.adapter.sends + consumer.adapter.edits)
         consumer.on_delta("\n" + "C" * 500)
         consumer.finish(self._big_text())
-        await asyncio.sleep(0.25)
-        await task
+        await asyncio.wait_for(task, timeout=10)
+        return interim
 
     @pytest.mark.asyncio
     async def test_deferred_pagination_is_default(self):
         consumer, adapter = _make_single_consumer()
-        await self._run_big(consumer)
+        interim = await self._run_big(consumer)
+        assert all(len(frame) <= adapter.MAX_MESSAGE_LENGTH for frame in interim)
 
         # One live message for the whole turn: no mid-stream seals…
         assert len(adapter.sends) == 1, adapter.sends
@@ -489,3 +483,35 @@ class TestOverlayStyleAndEffects:
         consumer.cfg.message_effect = "🎉"
         consumer.cfg.message_effect_min_seconds = 3600.0
         assert "message_effect" not in (consumer._metadata_for_send(final=True) or {})
+
+
+@pytest.mark.parametrize(
+    "event_type,tool_name,thinking,interrupted,expected",
+    [
+        ("tool.started", "terminal", False, False, True),
+        ("tool.started", "clarify", False, False, False),
+        ("tool.started", "_thinking", False, False, False),
+        ("_thinking", "private reasoning", False, False, False),
+        ("_thinking", "private reasoning", True, False, True),
+        ("tool.started", "terminal", False, True, False),
+        ("_thinking", "private reasoning", True, True, False),
+    ],
+)
+def test_single_message_callback_respects_thinking_and_stop(
+    event_type, tool_name, thinking, interrupted, expected,
+):
+    from unittest.mock import Mock
+    from gateway.run_turn_runner import TurnRunner
+
+    consumer, _ = _make_single_consumer(single_message_thinking=thinking)
+    ctx = SimpleNamespace(
+        log_queue=None, progress_queue=None, _live_status_adapter=None,
+        _run_still_current=lambda: True, stream_consumer_holder=[consumer],
+        agent_holder=[SimpleNamespace(is_interrupted=interrupted)],
+        last_progress_msg=[None], repeat_count=[0],
+    )
+    runner = TurnRunner(SimpleNamespace(), ctx)
+    runner._progress_build_message = Mock(return_value="🔧 tool activity")
+    runner.progress_callback(event_type, tool_name, "private reasoning", {})
+    consumer._drain_queue()
+    assert bool(consumer._tool_progress_lines) is expected
