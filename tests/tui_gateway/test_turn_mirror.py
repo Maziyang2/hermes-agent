@@ -24,7 +24,8 @@ import contextlib
 import logging
 import os
 import sqlite3
-import time
+import threading
+from contextvars import ContextVar
 from types import SimpleNamespace
 from typing import Any
 
@@ -317,13 +318,21 @@ class TestDeliver:
 
 
 class TestDeliveryThread:
-    def test_start_delivery_spawns_daemon_thread(self, monkeypatch):
+    def test_start_delivery_preserves_profile_context_in_daemon_thread(self, monkeypatch):
+        profile = ContextVar("mirror_test_profile", default="launch")
+        completed = threading.Event()
         ran = []
-        monkeypatch.setattr(turn_mirror, "_deliver", ran.append)
+
+        def deliver(plan):
+            ran.append((plan, profile.get(), threading.current_thread().daemon))
+            completed.set()
+
+        monkeypatch.setattr(turn_mirror, "_deliver", deliver)
         plan = turn_mirror.MirrorPlan(platform="telegram", chat_id="860", message="m")
-        turn_mirror._start_delivery(plan)
-        for _ in range(50):
-            if ran:
-                break
-            time.sleep(0.01)
-        assert ran == [plan]
+        token = profile.set("transport")
+        try:
+            turn_mirror._start_delivery(plan)
+        finally:
+            profile.reset(token)
+        assert completed.wait(2)
+        assert ran == [(plan, "transport", True)]

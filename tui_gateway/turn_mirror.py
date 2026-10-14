@@ -42,7 +42,6 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, cast
 
@@ -264,8 +263,10 @@ def mirror_turn(session: dict, agent: Any, user_text: Any, reply_text: Any, *,
 
 
 def _start_delivery(plan: MirrorPlan) -> None:
-    """Hand the plan to a detached daemon thread (the sender is network-bound)."""
-    threading.Thread(target=_deliver, args=(plan,), name="turn-mirror", daemon=True).start()
+    """Detach network delivery while preserving the caller's profile context."""
+    from agent.memory_provider import spawn_context_thread
+
+    spawn_context_thread(target=_deliver, args=(plan,), name="turn-mirror", daemon=True).start()
 
 
 def _deliver(plan: MirrorPlan) -> None:

@@ -7213,9 +7213,7 @@ def _is_connected(config) -> bool:
 
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False,
                            silent=False, chunk_indicators=True):
-    """Out-of-process delivery (standalone_sender_fn) so deliver=telegram cron jobs succeed without the
-    gateway; delegates to the REST ``_send_telegram`` sender.  ``silent`` / ``chunk_indicators`` pass
-    through the sender's two extra delivery modes (see ``tools.send_message_senders``)."""
+    """Standalone cron/CLI delivery through the shared REST sender, without a live gateway."""
     token = getattr(pconfig, "token", None)
     if not token:
         from agent.secret_scope import get_secret  # profile-scoped: never borrow another profile's token
@@ -7223,9 +7221,8 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
     from tools.send_message_tool import _send_telegram
     return await _send_telegram(
-        token, chat_id, message, media_files=media_files, thread_id=thread_id,
-        disable_link_previews=disable_link_previews, force_document=force_document,
-        silent=silent, chunk_indicators=chunk_indicators)
+        token, chat_id, message, media_files=media_files, thread_id=thread_id, silent=silent,
+        disable_link_previews=disable_link_previews, force_document=force_document, chunk_indicators=chunk_indicators)
 
 
 def interactive_setup() -> None:

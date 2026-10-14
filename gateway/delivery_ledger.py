@@ -332,7 +332,8 @@ def mark_attempting(obligation_id: str) -> None:
 
 
 def mark_delivered(obligation_id: str, platform_message_id: Optional[str] = None) -> None:
-    _update_state(obligation_id, "delivered", platform_message_id=platform_message_id)
+    _update_state(obligation_id, "delivered",
+                  platform_message_id=str(platform_message_id or "") or None)
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:

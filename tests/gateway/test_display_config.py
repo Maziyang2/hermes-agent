@@ -265,6 +265,7 @@ class TestCleanupProgress:
             }
             assert resolve_display_setting(config, "telegram", "cleanup_progress") is True, val
 
+
 class TestMirrorLocalTurns:
     """display.platforms.<platform>.mirror_local_turns* — local-surface turn mirroring."""
 
